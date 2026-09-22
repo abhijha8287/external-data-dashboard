@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Weather Pipeline Dashboard</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--fg:#14171f;--mut:#667085;--line:#e4e7ec;--acc:#2563eb;--avg:#d97706;--up:#dc2626;--down:#0891b2;--ok:#16a34a;--warn:#d97706;--bad:#dc2626}
+@media(prefers-color-scheme:dark){:root{--bg:#0e1116;--card:#171b22;--fg:#e8ebf0;--mut:#8b94a3;--line:#262c36;--acc:#60a5fa;--avg:#fbbf24;--up:#f87171;--down:#22d3ee;--ok:#4ade80;--warn:#fbbf24;--bad:#f87171}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}
+main{max-width:1000px;margin:0 auto;padding:20px 16px 48px}
+h1{font-size:18px;margin:0 0 14px;font-weight:600}h2{font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);margin:0 0 10px;font-weight:600}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+button{font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 12px;cursor:pointer}
+button[aria-pressed=true]{background:var(--acc);border-color:var(--acc);color:#fff}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px}
+.banner{border-radius:10px;padding:10px 14px;margin-bottom:14px;border:1px solid;font-size:14px}
+.banner.failing{background:color-mix(in srgb,var(--bad) 12%,transparent);border-color:var(--bad)}
+.banner.stale,.banner.no_data{background:color-mix(in srgb,var(--warn) 12%,transparent);border-color:var(--warn)}
+.banner.alert{background:color-mix(in srgb,var(--warn) 12%,transparent);border-color:var(--warn)}
+.hero{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+.big{font-size:52px;font-weight:650;letter-spacing:-.02em;line-height:1}
+.delta{font-size:20px;font-weight:600}.up{color:var(--up)}.down{color:var(--down)}
+.sub{color:var(--mut);font-size:13px;margin-top:6px}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;background:var(--mut)}
+.dot.ok{background:var(--ok)}.dot.stale,.dot.no_data{background:var(--warn)}.dot.failing{background:var(--bad)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.m{border:1px solid var(--line);border-radius:10px;padding:10px 12px}.m .k{color:var(--mut);font-size:12px}.m .v{font-size:20px;font-weight:600}.m .n{color:var(--mut);font-size:12px}
+.chartbar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:8px}
+.legend span{margin-right:14px;font-size:13px;color:var(--mut)}.legend i{display:inline-block;width:14px;height:3px;vertical-align:middle;margin-right:5px;border-radius:2px}
+svg{width:100%;height:auto;display:block;touch-action:none}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line)}th{color:var(--mut);font-weight:500}
+.st-error{color:var(--bad);font-weight:600}.st-ok{color:var(--ok)}.st-unchanged{color:var(--mut)}
+.tbl{overflow-x:auto}
+</style>
+</head>
+<body>
+<main>
+  <h1>Weather pipeline <span style="color:var(--mut);font-weight:400">· Open-Meteo, temperature at 2 m</span></h1>
+  <div class="tabs" id="tabs" role="tablist"></div>
+  <div id="banner"></div>
+  <div class="card">
+    <div class="hero"><div class="big" id="temp">–</div><div class="delta" id="delta"></div></div>
+    <div class="sub" id="sub"></div>
+  </div>
+  <div class="card"><h2>Derived metrics</h2><div class="grid" id="metrics"></div></div>
+  <div class="card">
+    <div class="chartbar">
+      <h2 style="margin:0">History</h2>
+      <div class="legend"><span><i style="background:var(--acc)"></i>Temperature</span><span><i style="background:var(--avg)"></i>Rolling avg</span></div>
+      <div id="ranges"></div>
+    </div>
+    <svg id="chart" viewBox="0 0 900 340" role="img" aria-label="Temperature history line chart"></svg>
+    <div class="sub" id="chartnote"></div>
+  </div>
+  <div class="card"><h2>Recent pulls (pipeline log)</h2><div class="tbl"><table id="runs"></table></div></div>
+</main>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const RANGES = [["6h", 6], ["24h", 24], ["All", 0]];
+let entity = localStorage.getItem("entity") || "london", rangeH = 24, entities = [];
+
+// Build DOM with textContent only: error strings originate upstream and must never be parsed as HTML.
+function el(tag, attrs = {}, text) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+const fmt = (v, d = 1, sign = false) => v == null ? "–" : (sign && v > 0 ? "+" : "") + v.toFixed(d);
+const ago = iso => { const s = (Date.now() - Date.parse(iso)) / 1000; return s < 90 ? "just now" : s < 5400 ? Math.round(s/60) + " min ago" : s < 172800 ? (s/3600).toFixed(1) + " h ago" : Math.round(s/86400) + " d ago"; };
+const local = iso => new Date(iso).toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"});
+
+async function api(path) {
+  const r = await fetch(path);
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.error || ("HTTP " + r.status));
+  return body;
+}
+
+function renderTabs() {
+  const t = $("tabs"); t.replaceChildren();
+  for (const e of entities) {
+    const b = el("button", {role: "tab", "aria-pressed": String(e.id === entity)}, e.name);
+    b.onclick = () => { entity = e.id; localStorage.setItem("entity", e.id); renderTabs(); load(); };
+    t.append(b);
+  }
+  const r = $("ranges"); r.replaceChildren();
+  for (const [label, h] of RANGES) {
+    const b = el("button", {"aria-pressed": String(h === rangeH)}, label);
+    b.onclick = () => { rangeH = h; renderTabs(); loadHistory(); };
+    r.append(b);
+  }
+}
+
+function renderLatest(d) {
+  const st = d.status, b = $("banner"); b.replaceChildren();
+  if (st.state !== "ok") {
+    const x = el("div", {class: "banner " + st.state});
+    x.append(el("strong", {}, st.state === "failing" ? "Data pull failed. " : st.state === "stale" ? "Data is stale. " : "No data. "), document.createTextNode(st.message));
+    if (st.last_success_at) x.append(document.createTextNode(" Last successful pull: " + ago(st.last_success_at) + "."));
+    b.append(x);
+  }
+  for (const a of d.alerts) {
+    const x = el("div", {class: "banner alert"}); x.append(el("strong", {}, "⚠ " + (a.code === "spike" ? "Spike: " : "Anomaly: ")), document.createTextNode(a.message)); b.append(x);
+  }
+  if (!d.latest) { $("temp").textContent = "–"; $("delta").textContent = ""; $("sub").textContent = ""; $("metrics").replaceChildren(); return; }
+  const m = d.metrics;
+  $("temp").textContent = fmt(d.latest.temperature_c) + " °C";
+  const dl = $("delta");
+  if (m.change_abs == null) { dl.textContent = ""; dl.className = "delta"; }
+  else {
+    dl.className = "delta " + (m.change_abs > 0 ? "up" : m.change_abs < 0 ? "down" : "");
+    dl.textContent = (m.change_abs > 0 ? "▲ " : m.change_abs < 0 ? "▼ " : "• ") + fmt(m.change_abs, 1, true) + " °C" + (m.change_pct == null ? "" : " (" + fmt(m.change_pct, 1, true) + "%)");
+  }
+  const dot = el("span", {class: "dot " + st.state});
+  const s = $("sub"); s.replaceChildren(dot, document.createTextNode(d.entity.name + " · observed " + local(d.latest.observed_at) + " (" + ago(d.latest.observed_at) + ") · wind " + fmt(d.latest.wind_kmh, 0) + " km/h · humidity " + fmt(d.latest.humidity_pct, 0) + "%" + (d.cached ? " · served from cache" : "")));
+  const cards = [
+    ["Rolling avg", fmt(m.rolling_avg) + " °C", "last " + m.rolling_n_used + " of " + m.rolling_window + " readings"],
+    ["Trend", fmt(m.slope_per_hour, 2, true) + " °C/h", "least-squares over window"],
+    ["Std dev", fmt(m.stdev, 2) + " °C", "sample, same window"],
+    ["Min (" + m.stat_hours + "h)", fmt(m.min.value) + " °C", local(m.min.at)],
+    ["Max (" + m.stat_hours + "h)", fmt(m.max.value) + " °C", local(m.max.at)],
+    ["Rate z-score", m.rate_z == null ? "–" : fmt(m.rate_z, 1, true), m.rate_z == null ? "needs more history" : "vs recent trend"],
+    ["Readings analysed", String(m.count), "most recent, for these metrics"],
+  ];
+  const g = $("metrics"); g.replaceChildren();
+  for (const [k, v, n] of cards) { const c = el("div", {class: "m"}); c.append(el("div", {class: "k"}, k), el("div", {class: "v"}, v), el("div", {class: "n"}, n)); g.append(c); }
+}
+
+// ---- Hand-rolled SVG line chart (no libraries) ----
+const NS = "http://www.w3.org/2000/svg";
+const S = (tag, attrs = {}, text) => { const e = document.createElementNS(NS, tag); for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); if (text !== undefined) e.textContent = text; return e; };
+
+function niceStep(range, ticks) {
+  const raw = range / ticks, p = Math.pow(10, Math.floor(Math.log10(raw))), f = raw / p;
+  return (f < 1.5 ? 1 : f < 3 ? 2 : f < 7 ? 5 : 10) * p;
+}
+
+function drawChart(points) {
+  const svg = $("chart"); svg.replaceChildren();
+  const W = 900, H = 340, L = 48, R = 16, T = 12, B = 30;
+  if (points.length < 2) { const t = S("text", {x: W/2, y: H/2, "text-anchor": "middle", fill: "var(--mut)"}, points.length ? "Only one reading so far" : "No history in this range"); svg.append(t); return; }
+  const ts = points.map(p => Date.parse(p.observed_at)), ys = points.map(p => p.temperature_c);
+  const all = ys.concat(points.map(p => p.rolling_avg));
+  let lo = Math.min(...all), hi = Math.max(...all); if (hi - lo < 1) { lo -= .5; hi += .5; }
+  const step = niceStep(hi - lo, 5); lo = Math.floor(lo / step) * step; hi = Math.ceil(hi / step) * step;
+  const t0 = ts[0], t1 = ts[ts.length - 1];
+  const X = t => L + (t - t0) / (t1 - t0) * (W - L - R), Y = v => T + (hi - v) / (hi - lo) * (H - T - B);
+  for (let v = lo; v <= hi + 1e-9; v += step) {
+    svg.append(S("line", {x1: L, x2: W - R, y1: Y(v), y2: Y(v), stroke: "var(--line)"}));
+    svg.append(S("text", {x: L - 8, y: Y(v) + 4, "text-anchor": "end", fill: "var(--mut)", "font-size": 12}, v.toFixed(step < 1 ? 1 : 0)));
+  }
+  const nx = 5;
+  for (let i = 0; i <= nx; i++) {
+    const t = t0 + (t1 - t0) * i / nx, d = new Date(t);
+    const lbl = (t1 - t0) > 36e5 * 30 ? d.toLocaleDateString([], {month: "short", day: "numeric"}) : d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+    svg.append(S("text", {x: X(t), y: H - 8, "text-anchor": i === 0 ? "start" : i === nx ? "end" : "middle", fill: "var(--mut)", "font-size": 12}, lbl));
+  }
+  // Break the line where data is missing (gap > 2.5x median spacing) instead of drawing a false straight segment.
+  const gaps = ts.slice(1).map((t, i) => t - ts[i]).sort((a, b) => a - b), gapMax = (gaps[gaps.length >> 1] || 9e5) * 2.5;
+  const path = key => { let d = ""; points.forEach((p, i) => { d += (i === 0 || ts[i] - ts[i-1] > gapMax ? "M" : "L") + X(ts[i]).toFixed(1) + " " + Y(p[key]).toFixed(1); }); return d; };
+  svg.append(S("path", {d: path("rolling_avg"), fill: "none", stroke: "var(--avg)", "stroke-width": 2, "stroke-dasharray": "6 4"}));
+  svg.append(S("path", {d: path("temperature_c"), fill: "none", stroke: "var(--acc)", "stroke-width": 2.2, "stroke-linejoin": "round"}));
+  // Hover crosshair
+  const cur = S("g", {visibility: "hidden"}), vl = S("line", {y1: T, y2: H - B, stroke: "var(--mut)", "stroke-dasharray": "3 3"}), dot = S("circle", {r: 4.5, fill: "var(--acc)", stroke: "var(--card)", "stroke-width": 2});
+  const tipBg = S("rect", {rx: 6, fill: "var(--fg)", opacity: .92, height: 22}), tip = S("text", {fill: "var(--bg)", "font-size": 12});
+  cur.append(vl, dot, tipBg, tip); svg.append(cur);
+  const move = ev => {
+    const r = svg.getBoundingClientRect(), px = ((ev.touches ? ev.touches[0].clientX : ev.clientX) - r.left) / r.width * W;
+    const t = t0 + (px - L) / (W - L - R) * (t1 - t0);
+    let i = 0, best = Infinity; ts.forEach((x, j) => { const dd = Math.abs(x - t); if (dd < best) { best = dd; i = j; } });
+    const x = X(ts[i]), y = Y(ys[i]);
+    vl.setAttribute("x1", x); vl.setAttribute("x2", x); dot.setAttribute("cx", x); dot.setAttribute("cy", y);
+    tip.textContent = local(points[i].observed_at) + "  " + ys[i].toFixed(1) + " °C  (avg " + points[i].rolling_avg.toFixed(1) + ")";
+    const w = tip.getComputedTextLength() + 16, tx = Math.min(Math.max(x - w / 2, L), W - R - w);
+    tipBg.setAttribute("x", tx); tipBg.setAttribute("y", T + 2); tipBg.setAttribute("width", w); tip.setAttribute("x", tx + 8); tip.setAttribute("y", T + 17);
+    cur.setAttribute("visibility", "visible");
+  };
+  svg.onmousemove = move; svg.ontouchmove = move; svg.onmouseleave = () => cur.setAttribute("visibility", "hidden");
+}
+
+async function loadHistory() {
+  try {
+    const q = new URLSearchParams({entity, limit: 2000});
+    if (rangeH) q.set("from", new Date(Date.now() - rangeH * 36e5).toISOString().slice(0, 19));
+    const h = await api("/history?" + q);
+    drawChart(h.points);
+    $("chartnote").textContent = h.count + " readings" + (h.truncated ? " (showing latest of " + h.total_in_range + ")" : "") + " · gaps in the line = missing data, not interpolated";
+  } catch (e) { $("chartnote").textContent = "Could not load history: " + e.message; }
+}
+
+async function loadRuns() {
+  const {runs} = await api("/runs?entity=" + encodeURIComponent(entity));
+  const t = $("runs"); t.replaceChildren();
+  const head = el("tr"); for (const h of ["When", "Kind", "Status", "New rows", "Latency", "Attempts", "Error"]) head.append(el("th", {}, h)); t.append(head);
+  for (const r of runs.slice(0, 8)) {
+    const tr = el("tr");
+    tr.append(el("td", {}, local(r.started_at)), el("td", {}, r.kind), el("td", {class: "st-" + r.status}, r.status), el("td", {}, String(r.rows_inserted)), el("td", {}, r.duration_ms + " ms"), el("td", {}, String(r.attempts)), el("td", {}, r.error || ""));
+    t.append(tr);
+  }
+  if (!runs.length) { const tr = el("tr"); const td = el("td", {colspan: 7}, "No pulls recorded yet."); tr.append(td); t.append(tr); }
+}
+
+async function load() {
+  try {
+    renderLatest(await api("/latest?entity=" + encodeURIComponent(entity)));
+  } catch (e) {
+    const b = $("banner"); b.replaceChildren(); const x = el("div", {class: "banner failing"}); x.append(el("strong", {}, "Dashboard cannot reach the API. "), document.createTextNode(e.message)); b.append(x);
+  }
+  loadHistory(); loadRuns().catch(() => {});
+}
+
+(async () => {
+  try { entities = (await api("/entities")).entities; } catch (e) { entities = []; }
+  if (!entities.some(e => e.id === entity) && entities.length) entity = entities[0].id;
+  renderTabs(); load();
+  setInterval(load, 60000);
+})();
+</script>
+</body>
+</html>
